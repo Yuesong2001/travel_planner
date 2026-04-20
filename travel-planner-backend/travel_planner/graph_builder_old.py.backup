@@ -1,0 +1,278 @@
+"""
+Graph Builder V4 - Main Entry Point
+Builds the final, sophisticated travel planning workflow using LangGraph.
+This version incorporates the Task Decomposer, Judgement Agent, and Plan Synthesizer.
+"""
+from typing import Dict, Any
+from langgraph.graph import StateGraph, END
+
+from .core.state import TravelState
+from .nodes.coordinator import Coordinator
+from .nodes.chat_node import ChatNode
+from .nodes.normalizer import DataNormalizer
+from .nodes.task_decomposer import TaskDecomposer
+from .nodes.judgement_agent import JudgementAgent
+from .nodes.plan_agent import ToolExecutor
+from .nodes.plan_synthesizer import PlanSynthesizer
+
+MAX_RETRIES = 3
+
+def build_travel_graph(llm, verbose: bool = False, trace_name: str = None, custom_judgement_prompt: str = None):
+    """
+    Builds the V4 travel planning graph with advanced agentic architecture.
+    
+    Args:
+        llm: The language model to use
+        verbose: Whether to print verbose logs
+        trace_name: Optional name for LangSmith trace (for distinguishing traces)
+        custom_judgement_prompt: Optional custom prompt for judgement agent
+    """
+    # --- 1. Initialize all components ---
+    coordinator = Coordinator()
+    chat_node = ChatNode(llm)
+    normalizer = DataNormalizer()
+    task_decomposer = TaskDecomposer(llm)
+    tool_executor = ToolExecutor(verbose=verbose)
+    
+    # Create judgement agent with custom prompt if provided
+    if custom_judgement_prompt:
+        judgement_agent = JudgementAgent(llm, tool_executor=tool_executor, custom_prompt=custom_judgement_prompt)
+    else:
+        judgement_agent = JudgementAgent(llm, tool_executor=tool_executor)
+    
+    plan_synthesizer = PlanSynthesizer(llm)
+
+    # --- 2. Define Node Handlers ---
+    def chat_handler(state: TravelState) -> Dict[str, Any]:
+        return chat_node.process_message(state)
+    
+    def normalize_handler(state: TravelState) -> Dict[str, Any]:
+        normalized_request = normalizer.normalize_travel_request(state.get("user_request", {}))
+        return {"user_request": normalized_request}
+
+    def task_decomposer_handler(state: TravelState) -> Dict[str, Any]:
+        result = task_decomposer.decompose_task(state)
+        return {
+            "sub_tasks": result.get("sub_tasks", []),
+            "current_sub_task_index": 0,
+            "completed_tasks_results": {},
+        }
+
+    def coordinator_handler(state: TravelState) -> Dict[str, Any]:
+        """
+        The true coordinator. It reviews the state and decides the next sub-task
+        or moves to synthesis.
+        """
+        index = state.get("current_sub_task_index", 0)
+        sub_tasks = state.get("sub_tasks", [])
+        
+        if verbose:
+            print(f"📋 Coordinator: Processing sub-task {index}/{len(sub_tasks)}")
+
+        # Aggregate results from the last completed sub-task
+        last_sub_task = state.get("current_sub_task")
+        if last_sub_task:
+            tool_results = state.get("tool_results", [])
+            final_tool_result = tool_results[-1] if tool_results else "No result"
+            completed_results = state.get("completed_tasks_results", {})
+            completed_results[last_sub_task] = final_tool_result
+            state["completed_tasks_results"] = completed_results
+            
+            if verbose:
+                print(f"✅ Coordinator: Completed sub-task '{last_sub_task}'")
+        
+        # Decide next step
+        if index >= len(sub_tasks):
+            if verbose:
+                print(f"🎯 Coordinator: All {len(sub_tasks)} sub-tasks completed, moving to synthesis")
+            return {"next_step": "synthesize"}
+
+        next_sub_task = sub_tasks[index]
+        if verbose:
+            print(f"➡️  Coordinator: Starting sub-task {index + 1}/{len(sub_tasks)}: '{next_sub_task}'")
+        
+        return {
+            "current_sub_task": next_sub_task,
+            "current_sub_task_index": index + 1,
+            "tool_results": [], # Clear tool results for the new sub-task
+            "next_step": "judge",
+            "current_retries": 0,
+            # Don't pre-set judgement - let the judgement agent decide from scratch
+        }
+
+    def judgement_handler(state: TravelState) -> Dict[str, Any]:
+        # Get current retry count
+        current_retries = state.get('current_retries', 0)
+        
+        # Make decision
+        result = judgement_agent.make_decision(state)
+        
+        # Check if the decision is valid
+        decision = result.get("judgement", {}).get("decision")
+        tool_call = result.get("judgement", {}).get("next_tool_call")
+        
+        # If decision is invalid or continue without valid tool_call, increment retry
+        if decision == "continue":
+            if not (tool_call and isinstance(tool_call, dict) and tool_call.get("name")):
+                current_retries += 1
+        elif decision not in ["complete", "continue"]:
+            current_retries += 1
+        
+        # Update retry count in the result
+        result['current_retries'] = current_retries
+        return result
+
+    def tool_executor_handler(state: TravelState) -> Dict[str, Any]:
+        return tool_executor.execute_tool(state)
+
+    def plan_synthesizer_handler(state: TravelState) -> Dict[str, Any]:
+        return plan_synthesizer.synthesize_plan(state)
+    
+    def fallback_handler(state: TravelState) -> Dict[str, Any]:
+        """A fallback node that provides a generic response when the process fails."""
+        return {
+            "travel_plan": "I apologize, but I encountered an issue and cannot complete your travel plan at this time. Please try again later or rephrase your request."
+        }
+
+    # --- 3. Define Routers (Conditional Edges) ---
+    def entry_router(state: TravelState) -> str:
+        """Routes from the entry point based on initial state."""
+        # The chat node will now determine if the request is complete.
+        # We always start there to process the user_message.
+        return "chat"
+
+    def chat_router(state: TravelState) -> str:
+        """After chat, decide if we have enough info to plan."""
+        intent = state.get("intent")
+        user_request = state.get("user_request")
+        # Check if we have intent to plan and a valid (non-empty) user_request
+        if intent == "plan" and user_request and isinstance(user_request, dict) and len(user_request) > 0:
+            return "normalize_input"
+        # If intent is "chat", we should END and wait for next user input
+        # This prevents infinite loops in interactive mode
+        if intent == "chat":
+            return "__end__"
+        return "__end__"  # Default to end to prevent infinite loops
+
+    def coordinator_router(state: TravelState) -> str:
+        """Routes from the main coordinator."""
+        if state.get("next_step") == "synthesize":
+            return "synthesize_plan"
+        return "judge"
+
+    def judgement_router(state: TravelState) -> str:
+        """Routes based on the JudgementAgent's decision, with a retry mechanism."""
+        current_retries = state.get('current_retries', 0)
+        
+        if current_retries >= MAX_RETRIES:
+            return "fallback"
+
+        judgement = state.get("judgement", {})
+        decision = judgement.get("decision")
+        
+        if decision == "complete":
+            # If the agent thinks the sub-task is done, go back to the coordinator to process results
+            return "coordinator"
+        
+        if decision == "continue":
+            tool_call = judgement.get("next_tool_call")
+            if tool_call and isinstance(tool_call, dict) and tool_call.get("name"):
+                return "execute_tool"
+            else:
+                # Continue but no valid tool call - this is an error, need to retry
+                # The retry count will be incremented in the judgement_handler
+                return "judge"
+        else:
+            # Invalid decision - need to retry
+            # The retry count will be incremented in the judgement_handler
+            return "judge"
+
+    # --- 4. Build the Graph ---
+    workflow = StateGraph(TravelState)
+
+    # Add nodes
+    workflow.add_node("chat", chat_handler)
+    workflow.add_node("normalize_input", normalize_handler)
+    workflow.add_node("decompose_task", task_decomposer_handler)
+    workflow.add_node("coordinator", coordinator_handler)
+    workflow.add_node("judge", judgement_handler)
+    workflow.add_node("execute_tool", tool_executor_handler)
+    workflow.add_node("synthesize_plan", plan_synthesizer_handler)
+    workflow.add_node("fallback", fallback_handler)
+
+    # Set entry point
+    workflow.set_entry_point("chat")
+
+    # Add edges
+    workflow.add_conditional_edges("chat", chat_router, {
+        "normalize_input": "normalize_input",
+        "__end__": END  # End execution when intent is "chat" to wait for user input
+    })
+    
+    workflow.add_edge("normalize_input", "decompose_task")
+    workflow.add_edge("decompose_task", "coordinator")
+
+    workflow.add_conditional_edges("coordinator", coordinator_router, {
+        "synthesize_plan": "synthesize_plan",
+        "judge": "judge"
+    })
+
+    workflow.add_conditional_edges("judge", judgement_router, {
+        "coordinator": "coordinator",
+        "execute_tool": "execute_tool",
+        "judge": "judge",
+        "fallback": "fallback"
+    })
+    
+    workflow.add_edge("execute_tool", "judge")
+    
+    workflow.add_edge("synthesize_plan", END)
+    workflow.add_edge("fallback", END)
+
+    # Compile the graph
+    graph = workflow.compile()
+    return graph
+
+
+# Convenience function
+def create_travel_planner(llm, verbose=False):
+    """Creates a V4 travel planner instance."""
+    return build_travel_graph(llm, verbose=verbose)
+
+
+# Example usage
+if __name__ == "__main__":
+    from langchain_openai import ChatOpenAI
+    
+    # Initialize LLM
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    
+    # Build the graph
+    planner = create_travel_planner(llm, verbose=True)
+    
+    # Run an example
+    initial_state = {
+        "user_message": "Plan a 3-day trip to San Francisco for a solo traveler on a budget of $1000. I'm interested in tech landmarks and good coffee.",
+        "user_request": {
+            "destination": "San Francisco",
+            "duration": "3 days",
+            "budget": "1000",
+            "interests": "tech landmarks, good coffee"
+        },
+        "conversation_history": [],
+        "intent": "plan" # Manually set for direct testing
+    }
+    
+    # The invoke method streams all intermediate states.
+    # We can print them to see the flow.
+    for s in planner.stream(initial_state, {"recursion_limit": 100}):
+        print("---")
+        # Print the key and the value of the output dictionary
+        for key, value in s.items():
+            print(f"{key}: {value}")
+        print("---")
+
+    # The final result is the last item in the stream
+    final_result = list(planner.stream(initial_state, {"recursion_limit": 10}))[-1]
+    print("\n\n====================\nFINAL TRAVEL PLAN:\n====================\n")
+    print(final_result.get('synthesize_plan', {}).get('travel_plan'))
