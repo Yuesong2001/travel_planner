@@ -70,6 +70,176 @@ WIKIPEDIA_HEADERS = {
 }
 
 
+# ============================================================================
+# Pinecone RAG helpers
+# All helpers are best-effort: if Pinecone is disabled or fails, they return
+# empty strings / no-op so the rest of the tool keeps working unchanged.
+# ============================================================================
+
+def _rag_destination_context(destination: str, top_k: int = 3) -> str:
+    """Pull cached destination knowledge and format it as a context block."""
+    try:
+        from .pinecone_utils import PineconeStore
+        store = PineconeStore.instance()
+        if not store.enabled:
+            return ""
+        hits = store.query_knowledge(
+            f"Travel guide for {destination}",
+            filter={"type": "destination"},
+            top_k=top_k,
+        )
+        if not hits:
+            return ""
+        lines = ["**Knowledge base context (from past research):**"]
+        for hit in hits:
+            text = (hit.get("metadata") or {}).get("text", "")
+            if text:
+                lines.append(f"- {text[:500]}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.debug(f"_rag_destination_context failed: {e}")
+        return ""
+
+
+def _rag_upsert_destination(destination: str, content: str, source: str = "wikipedia+llm") -> None:
+    """Index a destination guide for future RAG calls."""
+    if not destination or not content:
+        return
+    try:
+        from .pinecone_utils import PineconeStore, make_destination_id
+        store = PineconeStore.instance()
+        if not store.enabled:
+            return
+        store.upsert_knowledge(
+            [
+                {
+                    "id": make_destination_id(destination),
+                    "text": content,
+                    "metadata": {
+                        "type": "destination",
+                        "destination": destination,
+                        "source": source,
+                    },
+                }
+            ]
+        )
+    except Exception as e:
+        logger.debug(f"_rag_upsert_destination failed: {e}")
+
+
+def _rag_places_context(destination: str, kind: str, interests: str = "general", top_k: int = 5) -> str:
+    """Pull cached attractions/restaurants for a destination."""
+    try:
+        from .pinecone_utils import PineconeStore
+        store = PineconeStore.instance()
+        if not store.enabled:
+            return ""
+        query = f"{kind} in {destination} matching {interests}"
+        hits = store.query_knowledge(
+            query,
+            filter={"type": kind, "destination": destination},
+            top_k=top_k,
+        )
+        if not hits:
+            return ""
+        label = "Attractions" if kind == "attraction" else "Restaurants"
+        lines = [f"\n**Additional {label.lower()} from knowledge base:**"]
+        for hit in hits:
+            md = hit.get("metadata") or {}
+            name = md.get("name") or ""
+            rating = md.get("rating")
+            address = md.get("address") or ""
+            text = md.get("text", "")
+            entry = f"- {name}" if name else f"- {text[:200]}"
+            if rating:
+                entry += f" (rating: {rating})"
+            if address:
+                entry += f" — {address}"
+            lines.append(entry)
+        return "\n".join(lines)
+    except Exception as e:
+        logger.debug(f"_rag_places_context failed: {e}")
+        return ""
+
+
+def _rag_upsert_places(
+    destination: str,
+    places: list,
+    kind: str,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Index a batch of attractions or restaurants from Google Maps results.
+
+    Args:
+        destination: target city/country
+        places: list of Google Maps Place dicts (raw API response items)
+        kind: 'attraction' or 'restaurant'
+        extra_metadata: optional dict merged into every place's metadata
+    """
+    if not destination or not places:
+        return
+    try:
+        from .pinecone_utils import PineconeStore, make_place_id
+        store = PineconeStore.instance()
+        if not store.enabled:
+            return
+
+        items = []
+        for place in places:
+            name = place.get("name") or ""
+            if not name:
+                continue
+            rating = place.get("rating")
+            address = place.get("formatted_address", "")
+            place_id = place.get("place_id")
+            types = place.get("types") or []
+            price_level = place.get("price_level")
+
+            # Build searchable text
+            text_parts = [f"{name} in {destination}"]
+            if address:
+                text_parts.append(address)
+            if types:
+                pretty_types = ", ".join(t.replace("_", " ") for t in types[:5])
+                text_parts.append(f"Types: {pretty_types}")
+            if rating:
+                text_parts.append(f"Rating: {rating}")
+            text = " | ".join(text_parts)
+
+            metadata: Dict[str, Any] = {
+                "type": kind,
+                "destination": destination,
+                "name": name,
+                "source": "google_maps",
+            }
+            if address:
+                metadata["address"] = address
+            if rating is not None:
+                metadata["rating"] = float(rating)
+            if place_id:
+                metadata["place_id"] = place_id
+            if price_level is not None:
+                metadata["price_level"] = int(price_level)
+            if types:
+                metadata["place_types"] = [str(t) for t in types[:10]]
+            if extra_metadata:
+                metadata.update(extra_metadata)
+
+            items.append(
+                {
+                    "id": make_place_id(kind, place_id, f"{name}|{destination}"),
+                    "text": text,
+                    "metadata": metadata,
+                }
+            )
+
+        if items:
+            store.upsert_knowledge(items)
+    except Exception as e:
+        logger.debug(f"_rag_upsert_places failed: {e}")
+
+
 def research_destination(destination: str) -> str:
     """Researches basic information about a destination using Wikipedia API.
     
@@ -84,7 +254,12 @@ def research_destination(destination: str) -> str:
     logger.info("=" * 100)
     logger.info(f"📥 INPUT: destination = '{destination}'")
     logger.info("─" * 100)
-    
+
+    # RAG: pull cached destination knowledge to enrich the prompt.
+    rag_context = _rag_destination_context(destination)
+    if rag_context:
+        logger.info(f"📚 RAG: retrieved destination context ({len(rag_context)} chars)")
+
     # Try Wikipedia API first
     try:
         logger.info(f"📚📚📚 WIKIPEDIA API CALL: research_destination 📚📚📚")
@@ -140,6 +315,8 @@ def research_destination(destination: str) -> str:
                 **Wikipedia Information:**
                 {extract}
                 
+                {rag_context}
+
                 Use the Wikipedia data as the primary source, but format it as a helpful travel guide.
                 Keep it under 300 words, factual and helpful.
             """).strip()
@@ -156,6 +333,7 @@ def research_destination(destination: str) -> str:
             result = response.choices[0].message.content.strip()
             logger.info(f"📤 OUTPUT (Wikipedia + LLM):\n{result}")
             logger.info("=" * 100 + "\n")
+            _rag_upsert_destination(destination, result, source="wikipedia+llm")
             return result
         else:
             logger.warning(f"⚠️ Wikipedia returned unexpected page type: {wiki_data.get('type')}. Trying LLM fallback.")
@@ -165,15 +343,15 @@ def research_destination(destination: str) -> str:
         error_msg = f"Error accessing Wikipedia API: {str(e)}. Falling back to LLM."
         logger.warning(f"⚠️ WARNING: {error_msg}")
         logger.info("─" * 100)
-        return _research_destination_llm_fallback(destination)
+        return _research_destination_llm_fallback(destination, rag_context)
     except Exception as e:
         error_msg = f"Error researching destination: {str(e)}"
         logger.error(f"❌ ERROR: {error_msg}")
         logger.info("─" * 100)
-        return _research_destination_llm_fallback(destination)
+        return _research_destination_llm_fallback(destination, rag_context)
 
 
-def _research_destination_llm_fallback(destination: str) -> str:
+def _research_destination_llm_fallback(destination: str, rag_context: str = "") -> str:
     """Fallback to pure LLM if Wikipedia API fails."""
     research_prompt = textwrap.dedent(f"""
         Provide a concise travel guide for {destination} covering:
@@ -183,6 +361,8 @@ def _research_destination_llm_fallback(destination: str) -> str:
         - Transportation options within the city
         - Typical cuisine and dining culture
         
+        {rag_context}
+
         Keep it under 300 words, factual and helpful.
     """).strip()
     
@@ -199,6 +379,7 @@ def _research_destination_llm_fallback(destination: str) -> str:
         result = response.choices[0].message.content.strip()
         logger.info(f"📤 OUTPUT (LLM Fallback):\n{result}")
         logger.info("=" * 100 + "\n")
+        _rag_upsert_destination(destination, result, source="llm_fallback")
         return result
     except Exception as e:
         error_msg = f"Error researching destination: {str(e)}"
@@ -735,7 +916,15 @@ def find_attractions(destination: str, days: int, interests: str = 'general') ->
                 output_lines.append(f"   Description: {description}")
             output_lines.append("")
         
+        # Persist Google Maps places to Pinecone for future RAG calls.
+        _rag_upsert_places(destination, results, kind="attraction", extra_metadata={"interests": interests})
+
+        # Append cached/related attractions retrieved from the knowledge base.
+        rag_block = _rag_places_context(destination, kind="attraction", interests=interests)
+
         result = "\n".join(output_lines).strip()
+        if rag_block:
+            result = result + "\n" + rag_block
         logger.info(f"📤 OUTPUT:\n{result}")
         logger.info("=" * 100 + "\n")
         return result
@@ -991,7 +1180,24 @@ def suggest_restaurants(destination: str, budget_level: str, cuisine_preference:
             output_lines.append(f"   Address: {address}")
             output_lines.append("")
         
+        # Persist restaurants to Pinecone for future RAG calls.
+        _rag_upsert_places(
+            destination,
+            filtered_results,
+            kind="restaurant",
+            extra_metadata={
+                "budget_level": budget_level,
+                "cuisine": cuisine_preference,
+                "interests": interests,
+            },
+        )
+
+        # Append related restaurants from the knowledge base.
+        rag_block = _rag_places_context(destination, kind="restaurant", interests=interests)
+
         result = "\n".join(output_lines).strip()
+        if rag_block:
+            result = result + "\n" + rag_block
         logger.info(f"📤 OUTPUT:\n{result}")
         logger.info("=" * 100 + "\n")
         return result

@@ -24,6 +24,15 @@ from .tools_def import (
     AGENT_TOOLS,
 )
 
+from .pinecone_utils import (
+    PineconeStore,
+    KnowledgeItem,
+    make_place_id,
+    make_destination_id,
+    KNOWLEDGE_NAMESPACE,
+    PLANS_NAMESPACE,
+)
+
 __all__ = [
     # Constraints
     "parse_budget",
@@ -42,4 +51,11 @@ __all__ = [
     "suggest_restaurants",
     "ALL_TOOLS",
     "AGENT_TOOLS",
+    # Pinecone
+    "PineconeStore",
+    "KnowledgeItem",
+    "make_place_id",
+    "make_destination_id",
+    "KNOWLEDGE_NAMESPACE",
+    "PLANS_NAMESPACE",
 ]

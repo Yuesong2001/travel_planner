@@ -288,11 +288,38 @@ Create a `.env` file in the project root:
 # Required
 OPENAI_API_KEY=sk-...
 
+# Pinecone (optional but recommended for RAG and plan history)
+PINECONE_API_KEY=pcsk-...
+PINECONE_INDEX_NAME=travel-planner   # default: travel-planner
+PINECONE_CLOUD=aws                   # default: aws
+PINECONE_REGION=us-east-1            # default: us-east-1
+
 # Optional
 OPENAI_MODEL=gpt-4-turbo-preview
 API_PORT=8000
 DEBUG=false
 ```
+
+### Pinecone Setup
+
+The backend uses Pinecone for two purposes:
+1. **Knowledge base RAG** - destinations, attractions, and restaurants are indexed and recalled to augment LLM context.
+2. **Plan history** - successful plans are indexed and similar past plans are retrieved as few-shot examples.
+
+To enable Pinecone:
+
+1. Sign up at [pinecone.io](https://pinecone.io) and create an API key.
+2. Set `PINECONE_API_KEY` in your `.env` file. The index will be **auto-created** on first use (serverless, cosine metric, 1536 dimensions to match `text-embedding-3-small`).
+3. (Optional) Pre-seed the knowledge base with popular cities:
+
+```bash
+cd travel-planner-backend
+python -m scripts.seed_pinecone
+# or with custom cities:
+python -m scripts.seed_pinecone --cities "Tokyo,Paris,Bali"
+```
+
+If `PINECONE_API_KEY` is not set, all RAG calls become no-ops and the system falls back to its previous behavior.
 
 ## 🚀 Deployment
 

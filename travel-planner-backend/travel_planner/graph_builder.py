@@ -30,6 +30,7 @@ from .routers import (
     judgement_router,
     validation_router,
 )
+from .utils.pinecone_utils import PineconeStore
 
 MAX_RETRIES = 3
 
@@ -167,8 +168,28 @@ def build_travel_graph(llm, verbose: bool = False, enable_validation: bool = Tru
         return result
 
     def plan_validator_handler(state: TravelState) -> Dict[str, Any]:
-        """Validate the generated plan"""
-        return plan_validator.validate_plan(state)
+        """Validate the generated plan, then upsert to Pinecone if it passed."""
+        result = plan_validator.validate_plan(state)
+
+        # Persist successfully validated plans to Pinecone for future few-shot retrieval.
+        # Skip if validation failed, the plan is missing, or Pinecone is disabled.
+        if not result.get("validation_errors") and result.get("status") == "validated":
+            plan = state.get("plan")
+            if plan:
+                try:
+                    store = PineconeStore.instance()
+                    if store.enabled:
+                        ok = store.upsert_plan(plan)
+                        if verbose:
+                            print(
+                                f"📚 PlanValidator: plan upsert to Pinecone "
+                                f"{'succeeded' if ok else 'skipped/failed'}"
+                            )
+                except Exception as e:
+                    if verbose:
+                        print(f"⚠️ PlanValidator: failed to upsert plan to Pinecone: {e}")
+
+        return result
 
     def refine_plan_handler(state: TravelState) -> Dict[str, Any]:
         """Refine an existing plan based on user feedback"""

@@ -13,6 +13,7 @@ from datetime import datetime
 from ..core.prompt_templates import PLAN_SYNTHESIZER_PROMPT, PLAN_SYNTHESIZER_JSON_PROMPT
 from ..utils.maps_utils import add_travel_times_to_plan
 from ..utils.unsplash_utils import add_destination_image_to_plan
+from ..utils.pinecone_utils import PineconeStore
 import re
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,9 @@ class PlanSynthesizer:
         constraints = state.get("constraints", {})
         user_request = state.get("user_request", {})
 
+        # RAG: retrieve similar past plans for few-shot inspiration.
+        similar_plans_block = self._build_similar_plans_block(user_request, constraints)
+
         # Build context for JSON generation
         context = f"""
 **User Request:**
@@ -78,7 +82,7 @@ class PlanSynthesizer:
 
 **Constraints:**
 {json.dumps(constraints, indent=2, ensure_ascii=False)}
-
+{similar_plans_block}
 **Collected Information:**
 {data_section}
 """
@@ -186,6 +190,84 @@ class PlanSynthesizer:
 
         result["status"] = "completed"
         return result
+
+    def _build_similar_plans_block(self, user_request: Dict[str, Any], constraints: Dict[str, Any]) -> str:
+        """
+        Query Pinecone for similar past plans and format them as a context block.
+
+        Returns an empty string if Pinecone is disabled, no hits, or any failure occurs.
+        """
+        try:
+            destination = (user_request or {}).get("destination") or ""
+            if not destination:
+                return ""
+
+            interests = constraints.get("interests") if constraints else None
+            travel_type = constraints.get("travel_type") if constraints else None
+
+            store = PineconeStore.instance()
+            if not store.enabled:
+                return ""
+
+            hits = store.query_similar_plans(
+                destination=destination,
+                interests=interests,
+                travel_type=travel_type,
+                top_k=3,
+            )
+            if not hits:
+                return ""
+
+            blocks: List[str] = ["\n**Similar Past Plans (reference only):**"]
+            for idx, hit in enumerate(hits, start=1):
+                md = hit.get("metadata") or {}
+                plan_json_str = md.get("plan_json")
+                summary_text = md.get("text") or ""
+                score = hit.get("score")
+
+                header_parts = [f"Past Plan #{idx}"]
+                if score is not None:
+                    try:
+                        header_parts.append(f"similarity={float(score):.2f}")
+                    except (TypeError, ValueError):
+                        pass
+                if md.get("destination"):
+                    header_parts.append(f"destination={md.get('destination')}")
+                if md.get("travel_type"):
+                    header_parts.append(f"type={md.get('travel_type')}")
+                if md.get("duration_days"):
+                    header_parts.append(f"days={md.get('duration_days')}")
+
+                blocks.append(f"\n--- {' | '.join(header_parts)} ---")
+
+                # Prefer the structured plan if available.
+                if plan_json_str:
+                    try:
+                        past_plan = json.loads(plan_json_str)
+                        for day in past_plan.get("days", []) or []:
+                            blocks.append(
+                                f"Day {day.get('day')}: {day.get('summary', '')}"
+                            )
+                            for item in (day.get("items") or [])[:6]:
+                                blocks.append(
+                                    f"  - [{item.get('time', '')}] "
+                                    f"{item.get('place', '')}: {item.get('reason', '')}"
+                                )
+                        continue
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                if summary_text:
+                    blocks.append(summary_text[:800])
+
+            block = "\n".join(blocks)
+            logger.info(
+                f"📚 PlanSynthesizer RAG: retrieved {len(hits)} similar plan(s) for '{destination}'"
+            )
+            return block + "\n"
+        except Exception as e:
+            logger.warning(f"_build_similar_plans_block failed: {e}")
+            return ""
 
     def _generate_json_streaming(self, context: str, stream_callback) -> str:
         """

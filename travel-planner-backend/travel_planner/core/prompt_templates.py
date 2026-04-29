@@ -473,6 +473,11 @@ The JSON MUST follow this exact schema:
     - **Reference the actual places, ratings, and addresses from the collected data**
     - **Do not create generic place names - use the real names provided in the collected information**
     - **If collected information includes restaurant suggestions, use those specific restaurant names - rotate through them if needed**
+12. **Similar Past Plans (if provided):**
+    - The context may include a `**Similar Past Plans (reference only):**` section with previously generated itineraries for the same or similar destinations.
+    - Treat them as INSPIRATION ONLY - extract pacing ideas, day themes, and notable places.
+    - **Do NOT copy past plans verbatim.** Always tailor the new plan to the current user's constraints, dates, interests, and budget.
+    - If a past plan references a place that does not appear in the current `**Collected Information:**`, prefer places from the collected information instead.
 
 **Example Output:**
 
